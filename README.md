@@ -1,213 +1,250 @@
-# tabletop-game-balancer
+# Tabletop Game Balancing: Autoresearch with Expensive Feedback
 
-Entry for the [2026 Tabletop Games Balancing Competition](https://balance-competition.tabletopgames.ai)
-(IEEE CoG 2026). **Best score: 3652.5 / 4000**, from about 9,000 evaluations.
-The submitted rules are in [`results/winning_submission.json`](results/winning_submission.json).
+**2nd place in the 2026 Tabletop Games Balancing Competition (IEEE CoG), with
+3652.5 / 4000 points.** The [official results](https://balance-competition.tabletopgames.ai/)
+confirm the placing; the exact score and submitted rules are archived in
+[`results/winning_submission.json`](results/winning_submission.json).
 
-## The problem
+We explored black-box optimization and tabular foundation models as building
+blocks for autoresearch. The practical problem was familiar: a full evaluation
+was too expensive to use for every idea, so we researched with smaller samples.
+Then we had to work out which improvements survived a more expensive evaluation.
 
-Four games: Dominion, Exploding Kittens, 7 Wonders, Can't Stop. You pick the
-rules. A server plays each game many times with four fixed AI players and scores
-how balanced it came out, up to 1000 per game.
+Synthefy's Nori was one of several search methods we tried, and it contributed
+useful candidates. Our judgment is that measurement design, repeated evaluation,
+and checking transfer mattered more to the final result. We did not run the
+ablations needed to assign a numerical contribution to each component. This
+repository shares the methods, mistakes, and outcome as a learning resource.
 
-You cannot see inside. You send rules, you get back one number.
+[The ML story](#the-ml-story) · [The search methods](#where-tabular-foundation-models-fit)
+· [Running it](#running-it) · [Competition reference](#competition-reference)
+· [Submission ledger](#submission-ledger)
 
-You also choose how many games the server plays first:
+## The ML story
 
-| setting | games played | time per run |
-|---|---|---|
-| `fast` | 36 | 2–15 min |
-| `medium` | 360 | 15–40 min |
-| `full` | 3,600 | hours — the leaderboard uses this |
+Full training runs, large simulation campaigns, and comprehensive evaluations
+can make each research iteration expensive. A common response is to reduce the
+budget: train for fewer steps, use less data, or evaluate on fewer samples. That
+makes experimentation possible. It also creates a second question alongside
+optimization: how informative is the cheaper experiment about the objective we
+ultimately care about?
 
-The optimisers here are ordinary. What decided the score was **how we measured**.
+[Karpathy's autoresearch](https://github.com/karpathy/autoresearch) makes the
+appeal of a short automated loop concrete: an agent edits a training program,
+runs a fixed five-minute experiment, and compares validation performance. When
+that budget is the actual objective, improving it is directly useful. When the
+intended deployment uses a larger training or evaluation budget, transfer to
+that setting needs its own evidence.
+
+Our view is that useful autoresearch must choose **what to try, how much to spend
+on it, and what evidence is sufficient to keep it**. A faster proposal loop can
+also select more lucky observations or optimize a misleading proxy more
+aggressively. An expressive search model does not by itself resolve that risk.
+This is a recognized issue in [multi-fidelity optimization with unreliable
+information sources](https://proceedings.mlr.press/v206/mikkola23a.html).
+
+For reasoning about it, write a cheap measurement as:
+
+```text
+cheap_score(x) = expected_full_score(x) + fidelity_bias(x) + sampling_noise
+```
+
+This is a decomposition, not a fitted model in this repo. Repeating a measurement
+can reduce uncertainty from sampling noise. It does not establish that the
+fidelity-dependent bias is small. Choosing the maximum among many noisy scores
+also makes the selected winner's apparent advantage especially suspect.
+
+The competition let us study this problem through game simulations. Our
+low-budget experiments changed the number of simulated games; we did not test
+scaling laws, larger neural networks, or full model-training runs. The lessons
+for those settings are a research hypothesis, while the observations below come
+from this particular evaluation problem. The software automates configuration
+search and repeated evaluation; the campaign's strategic decisions and final
+submissions still involved human judgment.
+
+## A concrete expensive black box
+
+We chose rules for Dominion, Exploding Kittens, 7 Wonders, and Can't Stop. The
+evaluator ran fixed AI agents and scored how closely their matchup win rates
+matched a target. A balanced result could require a stronger agent to win more
+often; making every matchup 50/50 was not the objective. Each game contributed
+up to 1000 points. See the [official scoring specification](https://balance-competition.tabletopgames.ai/games).
+
+| Evaluation budget | Simulated games | Approximate time observed per evaluation |
+|---|---:|---|
+| `fast` | 36 | 2–15 minutes |
+| `medium` | 360 | 15–40 minutes |
+| `full` | 3,600 | Hours; used for leaderboard entries |
+
+Timings varied by game, configuration, and infrastructure. Our campaign notes
+record approximately 9,000 evaluations across the search. Candidate proposals
+were cheap enough that deciding which ones deserved another simulation became
+an important part of the work.
 
 ```mermaid
 flowchart LR
-    A["search<br/><i>propose rules</i>"] --> B["confirm<br/><i>measure 3+ times</i>"]
-    B --> C["submit<br/><i>change ONE game</i>"]
-    C --> D["read full score<br/><i>the only ground truth</i>"]
-    D -->|"keep what really helped"| A
+    A[Propose configurations] --> B[Choose evaluation budget]
+    B --> C[Measure and record observations]
+    C --> D[Repeat promising candidates]
+    D --> E[Check selected changes at full fidelity]
+    E --> F[Update candidates and trust in the proxy]
+    F --> A
 ```
 
----
+## What transferred, and what did not
 
-## Methods
+The numbers in this section are historical campaign notes. The complete
+observation database and the script for the reported leave-one-out experiment
+are not checked in. The final bundle and submission ledger are preserved;
+a fresh clone can run the tooling but cannot independently reconstruct every
+historical statistic below.
 
-### 1. Measure again before believing
+**Selecting noisy winners inflated the apparent result.** An early bundle made
+from each game's best individual observation read about **3781**, then about
+**3485** when remeasured. That gap combines selection effects and measurement
+uncertainty; the notes do not isolate their individual contributions. We moved
+toward repeated means and racing survivors to greater observation depth.
+[`evaluate.py`](src/ttbalance/evaluate.py) and
+[`cache.py`](src/ttbalance/cache.py) implement that process.
 
-A `fast` run is only 36 games, so one score is mostly luck.
+**The useful evaluation budget depended on the game and candidate set.** A
+historical diagnostic compared the range of medium means against typical
+within-configuration variation:
 
-We learned this the hard way. Taking each game's best single score gave a bundle
-that read **3781**. Measured properly, it was **3485**. Nearly 300 points were
-noise.
+| Game | Range of medium means | Median within-config SD | Heuristic ratio |
+|---|---:|---:|---:|
+| Exploding Kittens | 104.5 | 21.2 | 8.5 |
+| 7 Wonders | 47.2 | 22.1 | 3.7 |
+| Can't Stop | 25.3 | 13.1 | 3.3 |
+| Dominion | 18.0 | 12.7 | 2.5 |
 
-So [`evaluate.py`](src/ttbalance/evaluate.py) stores every measurement ever made
-and never repeats work. `Evaluator.race()` runs a knockout: measure everything
-once, drop the losers, measure the survivors more. Nothing gets submitted until
-it has been measured at least three times.
+The ratio is approximately `range / (SD / sqrt(3))`, matching the diagnostic in
+`scripts/reproduce.sh`. It helped us prioritize Exploding Kittens. It is not a
+statistical test of ranking reliability or a measurement of fast-to-full
+transfer: it depends on which configurations were sampled and assumes a common
+three-repeat depth even when actual counts differ.
 
-### 2. Check the cheap test per game
+**An attractive small-sample relationship could still mislead us.** Early notes
+called Exploding Kittens' fast/medium relationship negative (−0.79 on a small
+rank-correlation sample). A later calculation on 18 paired configurations was
++0.43. Those estimates used different samples and should not be treated as a
+stable property of the game. Similarly, two matching Dominion examples led us
+to trust `fast`; replacing Dominion with a higher-fast candidate subsequently
+lost **32.4 leaderboard points**. Local agreement did not justify that decision.
 
-The obvious way to save time is to search with `fast` and only confirm winners
-at `medium`. Whether that works **depends on the game**, so we measured it
-instead of assuming.
+**Changing one game made the evidence easier to interpret.** The v6→v7 bundle
+changed three games, improving the medium estimate by **44.9** but the full score
+by only **1.6**. Reverting just 7 Wonders from v7 then gained **30.6** at full
+fidelity, despite a recorded medium change of **−14.8**. This motivated smaller,
+attributable submission changes. It does not prove that multi-game changes
+transfer worse in general, or that any one full evaluation is noise-free.
+The [ledger below](#submission-ledger) keeps the actual comparisons visible.
 
-For Dominion the cheap test agrees with the expensive one (fast 963 → medium
-971, 961 → 969). For Exploding Kittens it mostly does not, and a `fast`-driven
-search made that game *worse* for hours before we checked.
+We also inspected score components through [`modal_localapi.py`](modal_localapi.py).
+One Exploding Kittens diagnostic showed a matchup-distance problem with zero
+first-player deviation; the Elite/Good matchup read 33.3% against a 60% target.
+That suggested hypotheses about the rules. Cheap diagnostic improvements still
+needed confirmation: two such directions were rejected at `medium`. The
+[official games page](https://balance-competition.tabletopgames.ai/games) now
+publishes target matrices, so reading logs is useful for the measured outcomes,
+not the sole way to learn the targets.
 
-The test: is the gap between configurations bigger than the measurement noise?
+## Where tabular foundation models fit
 
-| game | gap between configs | noise | ratio | can `medium` rank them? |
-|---|---|---|---|---|
-| Exploding Kittens | 104.5 | 21.2 | **8.5** | yes |
-| 7 Wonders | 47.2 | 22.1 | 3.7 | barely |
-| Can't Stop | 25.3 | 13.1 | 3.3 | barely |
-| Dominion | 18.0 | 12.7 | 2.5 | no |
+A search history naturally forms a table: a configuration's parameters are the
+features, and its measured score is the label. We explored several ways to use
+that history:
 
-Only Exploding Kittens can be ranked reliably. We spent our search time there.
-Run it yourself: `./scripts/reproduce.sh diagnose`.
+| Searcher | How it proposes the next experiments |
+|---|---|
+| `random` | Uniform samples; a simple baseline |
+| `hill` | Local parameter changes and restarts |
+| `ea` | Population selection, crossover, mutation, and repeated evaluation |
+| `pbil` | Update a distribution over parameter choices from successful samples |
+| `nori` | Predict candidate scores with a tabular foundation model and select a batch |
 
-### 3. Change one game per submission
+These implementations share the evaluator in [`optimizers/`](src/ttbalance/optimizers/).
+We did not compare them on the real games with identical starting data and equal
+compute budgets. The offline mock checks implementation behavior; it cannot
+establish which searcher is strongest on the competition objective.
 
-Submissions are unlimited, and the leaderboard is the **only** place we can see
-a `full` score. So every submission is an experiment — and an experiment only
-tells you something if you change one thing.
+[Nori](https://github.com/Synthefy/synthefy-nori) predicts new tabular rows using
+labelled examples as context, without task-specific gradient training. Its
+predictive output includes quantiles. That interface made it convenient to
+refresh a surrogate as measurements arrived. Data preparation, inference, and
+the search policy still have costs and choices; calling `fit` is not evidence
+that the entire optimization problem has become free of tuning.
 
-One bundle changed three games at once. It gained **+45** by our own
-measurements and **+1.6** on the leaderboard. We split it into three submissions
-that each changed one game. The entire loss came from a single game (7 Wonders),
-and fixing just that recovered **+35**.
+In our medium-fidelity campaigns, the loop in
+[`surrogate.py`](src/ttbalance/optimizers/surrogate.py) did the following:
 
-[`transfer.py`](src/ttbalance/transfer.py) works out per-game transfer rates
-from the submission history. Single-game changes off a well-measured baseline
-carry over almost fully. Bundles built on thin measurements carry over at 0.13.
+1. Encode parameters as numbers and subset membership indicators.
+2. Supply the observed configurations and their mean `medium` scores to Nori.
+3. Propose roughly 2,000 unseen configurations from random draws and mutations.
+4. Rank them with `q50 + kappa * max(q90 - q50, 0)` and select about 10, penalizing
+   near-duplicates within the batch.
+5. Evaluate those candidates, reobserve thinly measured leaders, and update the
+   mutation rate after success or failure streaks.
 
-### 4. Surrogate search
+The quantile bonus is an exploration heuristic. We did not establish that these
+quantiles were calibrated on this search distribution or that their spread
+isolated uncertainty about the mean from simulation noise. Likewise, the
+adaptive mutation rate is a simple heuristic inspired by trust-region search;
+it does not inherit another optimizer's theoretical guarantees.
 
-[`optimizers/`](src/ttbalance/optimizers/) has `random` and `hill` as controls,
-`pbil` (averages over a whole generation, so noise hurts it less), and `nori` —
-a loop around [Synthefy's Nori](https://github.com/Synthefy/synthefy-nori)
-tabular foundation model.
+The campaign notes attribute three of the four final configurations to direct
+medium search without prior fast measurements. This is evidence that the loop
+produced useful configurations. It does not measure its advantage over PBIL,
+a Gaussian process, or another surrogate.
 
-Each round:
+### Can a weak cheap signal still help?
 
-1. Show Nori every configuration measured so far, with its `medium` score. Only
-   `medium` — `fast` scores would teach it the wrong thing.
-2. Invent ~2,000 new configurations and have Nori predict all of them at once.
-3. Rank them by `q50 + κ·(q90 − q50)`: prefer a high predicted score, plus a
-   bonus where the model is unsure.
-4. Actually measure the top ~10. Add the results. Repeat.
+We also explored predicting `medium` from **parameters plus the fast score**.
+A weak proxy can be useful as an input if it adds predictive information beyond
+the parameters. That usefulness must be tested; it is not guaranteed by the
+model's capacity to represent a complicated relationship.
 
-It also shrinks its search radius when progress stalls and expands it when
-things are working (TuRBO-style), avoids picking near-identical candidates in
-one batch, and re-measures its current leaders as it goes.
+[`multifidelity.py`](src/ttbalance/multifidelity.py) uses configurations with
+medium labels and adds their fast means where available. Missing fast scores
+remain missing. It does not turn fast-only configurations into medium-labelled
+training examples. [`mf_screen.py`](scripts/mf_screen.py) screens candidates at
+fast, uses the model to shortlist them, and requests three medium observations
+for each selected candidate.
 
-Three of the four configurations in the final bundle were **never measured at
-`fast` at all** — proposed straight at `medium` by this loop. Why this kind of
-model, and what it cannot do, has
-[its own section below](#why-a-tabular-foundation-model--and-where-it-falls-short).
+A historical leave-one-out comparison on 18 paired Exploding Kittens
+configurations reported medium-score MAE of **28.21** using parameters alone,
+**25.97** after adding the fast score, and **35.10** for a mean baseline. We treat
+that as a small, encouraging proxy-prediction result. It did not establish a
+statistically reliable improvement in search, a lower total compute cost, or
+better full-fidelity performance. Those require prospective evaluation.
 
-### 5. Use the cheap score as a *clue*, not a *ranking*
+### Our position on the model and the research loop
 
-Ranking by `fast` fails. But that only rules out `fast` as a **ranking**. As one
-input among many it is still useful — a model can learn a weak or even backwards
-relationship and still profit from it.
+We see tabular foundation models as a promising, convenient surrogate option
+when configurations can be represented as rows and labels are expensive. Their
+prior learned across tasks may help make use of a small experiment history.
+They still need informative labels, a suitable representation, and validation
+on the task being optimized. No prior supplies the missing full-fidelity
+observations needed to establish transfer here.
 
-```mermaid
-flowchart LR
-    P["~300 candidates"] --> F["screen all at <b>fast</b><br/><i>~2 min each, in parallel</i>"]
-    F --> M["model predicts the<br/><b>medium</b> score<br/><i>using params + fast score</i>"]
-    M --> T["measure only the<br/>top ~8 at <b>medium</b><br/><i>15–40 min each</i>"]
-    T --> R["confirmed winner"]
-```
+The current loop gives each configuration mean one label regardless of repeat
+count, so it does not explicitly weight a seven-repeat mean more than a
+single observation. Confirmation handles part of that problem outside the
+surrogate. A noise-aware GP, a tree-based model, and simpler search methods
+remain credible alternatives; this experiment did not rule them out.
 
-[`multifidelity.py`](src/ttbalance/multifidelity.py) trains on
-`[parameters, fast score] → medium score`, leaving the cheap column blank where
-that configuration was never run cheaply. Tested by leave-one-out on the 18
-Exploding Kittens configurations that have both: average error drops from
-**28.21 to 25.97** (predicting the average would give 35.10).
-[`scripts/mf_screen.py`](scripts/mf_screen.py) runs this loop.
+Our strongest lesson for autoresearch is to make the evidence loop explicit.
+Record which evaluator produced a score, revisit apparent winners, and spend
+some budget checking the target objective. Automating those decisions and
+validating the proxy can matter as much as improving candidate proposals. In
+this campaign, we believe they mattered more.
 
-### 6. Read what the score is made of
-
-The server logs more than the final number. [`modal_localapi.py`](modal_localapi.py)
-reads its output and pulls out `matrix_distance`, `fpa_diff`, and both the
-actual and target win-rate tables.
-
-For our best Exploding Kittens rules, **all** the lost points come from the
-win-rate table (distance 190); first-player fairness is already perfect
-(`fpa_diff` 0). The single biggest miss: the strongest AI should beat the
-second-strongest **60%** of the time, and only manages **33.3%**. Our search had
-been flattening the skill gap when the target wanted it steeper.
-
-This season's target tables are not published anywhere, so reading them out of
-the log is the only way to see them.
-
-### 7. Run many evaluations at once
-
-We measured this rather than assuming it: the evaluator image runs **one game
-process at a time** and does not queue. One container gives you no parallelism
-no matter how many cores it has — a 6-CPU container finished the same job in
-2352 s versus 2379 s for 1 CPU.
-
-So throughput means many containers, each handling exactly one request at a
-time. [`scripts/localapi.sh`](scripts/localapi.sh) runs a local pool.
-[`modal_localapi.py`](modal_localapi.py) runs the same image on Modal as a
-*function*, not a web endpoint — a web request times out around 150 s and our
-evaluations take up to 40 minutes.
-
----
-
-## Why a tabular foundation model — and where it falls short
-
-Nori learns from examples given to it in the moment: hand it a table of
-configurations and their scores, and it predicts new rows in one pass. There is
-no training step and nothing to tune.
-
-That matters because of how this search actually runs. Every round adds ~10 new
-measurements and the model is rebuilt from scratch — about 40 times per game.
-Anything with settings of its own becomes a second tuning problem sitting on top
-of the one being solved.
-
-### What this problem demands
-
-Six things, and they knock out most of the usual choices:
-
-| What the search needs | Tabular foundation model | Gaussian process | Gradient boosting | Linear model |
-|---|---|---|---|---|
-| **Rebuild ~40× per game** as results arrive | free — hand it the table | needs a kernel choice and a fresh fit each time | fast, but has its own settings | free |
-| **13–36 mixed columns** — ordered numbers next to yes/no flags for which cards are in play | handles both | needs a custom kernel per game | handles both | needs interaction terms written by hand |
-| **Blank cells** where a configuration was never run cheaply (see §5) | handles them | no — must invent a fill-in value | handles them | no |
-| **A range, not one number**, so the search knows where it is unsure | gives q10 / q50 / q90 | yes — this is its whole purpose | only with extra work | only under assumptions |
-| **20–750 labelled rows** per game | built for this size | built for this size | overfits | fits, but too rigid to capture the shape |
-| **Labels of unequal reliability** — a score from 1 repeat vs 7 | **no** | yes — a per-point noise term | no | only with weights |
-
-The last row is the one place a Gaussian process is plainly better, and it is
-not a small point on an objective this noisy.
-
-The range in row four is what drives the search. Candidates are ranked by
-`q50 + κ·(q90 − q50)` — the predicted score, plus a bonus wherever the model
-admits it does not know. Without that second term the search only ever revisits
-what already looks good.
-
-### Where it falls short
-
-| Limitation | What it cost | What we did about it |
-|---|---|---|
-| **Every label weighs the same.** A score averaged over 7 measurements counts no more than one lucky single run. | The model happily chases noise. Early on this is exactly how a bundle reads 3781 and confirms at 3485. | Confirmation happens *outside* the model. Nothing is believed until it survives 3+ repeats (§1). |
-| **Bad input, confident bad output.** | Fed `fast` scores for Exploding Kittens, it reproduced the misleading pattern faithfully — and with a *narrow* confidence range, so the search never doubted it. | `fast` is never used as a label. It enters only as one more column (§5). A model cannot repair a measurement mistake. |
-| **Nothing to look inside.** No kernel, no coefficients, no importances. | "Which parameter actually matters?" is unanswerable from the model. | Answered separately: one-variable-at-a-time submissions (§3) and the score breakdown (§6). |
-| **Wrong tool below ~15 rows.** | The `medium → full` relationship gets one new label per submission — 14 in total. | Plain regression there instead: [`calibrate.py`](src/ttbalance/calibrate.py), [`transfer.py`](src/ttbalance/transfer.py). |
-| **Each round is a network call.** | Irrelevant here, since one `medium` measurement takes 15–40 minutes anyway. | Would rule it out entirely for a cheap objective. |
-| **Never proved better than the alternatives.** | No head-to-head against `pbil` on identical data was ever run. | The honest claim: these configurations came out of this loop — not that nothing else would have found them. |
-
-The pattern across the table is that the model is good at *proposing* and bad at
-*judging*. Everything that decides what to believe — repeat counts, which
-measurement to trust, what a change was really worth — is handled by the
-measurement discipline around it, not by the model.
-
+To turn that view into a stronger empirical claim, we would next compare
+searchers from the same initial data under equal evaluation cost, repeat those
+campaigns across seeds, and compare their selected candidates on fresh full
+runs. Separately, we would ablate the fast-score feature and the quantile bonus,
+and measure how well cheap experiments retain the candidates that win at full
+fidelity. These are proposed experiments, not results of this repository.
 
 ## Running it
 
@@ -222,8 +259,11 @@ python -m pip install -r requirements.txt
 Optional dependencies are separate: `requirements-dev.txt` adds NumPy and pandas
 for the complete offline test suite; `requirements-nori.txt` adds the Nori SDK;
 `requirements-modal.txt` adds Modal. Install both Nori and Modal requirements into
-`.venv-nori` before using `scripts/search_modal_medium.sh`. Nori service calls
-also require the SDK's configured credentials.
+`.venv-nori` before using `scripts/search_modal_medium.sh`. This repo imports
+`NoriRegressor` from the local `synthefy-nori` package. Its public checkpoint is
+downloaded on first use; hosted inference is a separate upstream option. See
+[Nori installation and model access](https://github.com/Synthefy/synthefy-nori#install)
+for runtime requirements. Modal requires its own account and deployment setup.
 
 ```bash
 ./scripts/reproduce.sh check       # offline: tests + an optimiser run, no API needed
@@ -235,9 +275,11 @@ also require the SDK's configured credentials.
 ./scripts/reproduce.sh bundle      # print the submission JSON
 ```
 
-`check` needs only Python and takes about a minute. It runs the tests and a full
+`check` installs the base Python dependencies and runs the tests and a complete
 optimiser loop against [`mock.py`](src/ttbalance/mock.py), a stand-in for the
-API that runs offline. The later steps need a real evaluator and take hours.
+API that runs offline. Install `requirements-dev.txt` to exercise every numerical
+test. The later steps need a real evaluator and take hours; they run new searches
+rather than reconstructing the exact competition trajectory.
 
 For Modal: `modal deploy modal_localapi.py`, then pass `--backend modal`.
 
@@ -286,87 +328,168 @@ object reuse in-flight work. Separate processes must still use disjoint containe
 pools. Backend errors are reported and counted; a batch with no usable scores
 fails, and unexpected programming errors propagate.
 
----
 
-## Layout
+## Competition reference
 
+This section consolidates the former competition notes. The competition has
+finished. The [official timeline](https://balance-competition.tabletopgames.ai/),
+checked on 2026-09-09, lists opening on 28 February, the end of testing on
+31 March, submissions closing on **1 September**, and the winner announcement
+on 3 September 2026. The closing date supersedes the 25 August date in our
+earlier notes.
+
+### Rules and scoring
+
+The fixed agents are Elite (tuned MCTS), Good (MCTS with half Elite's time
+budget), OSLA (one-step greedy), and Random. Dominion, Exploding Kittens, and
+Can't Stop are evaluated with two players; 7 Wonders uses four. The first three
+have a 50% first-player target; 7 Wonders has simultaneous turns and no
+first-player term. Scoring measures distance from specified matchup targets,
+with per-game scaling. The [official formulas and matrices](https://balance-competition.tabletopgames.ai/games)
+are the reference for the scoring convention.
+
+Parameter definitions are in [`config/valid_params.json`](config/valid_params.json),
+from the [organisers' examples](https://github.com/longhousedev/balance-comp-examples).
+
+| Game identifier | Parameters | Subset constraints |
+|---|---:|---|
+| `Dominion` | 10 | `CARDS`: exactly 10 of 26 kingdom cards |
+| `ExplodingKittens` | 14 | One boolean; the remaining parameters are integers |
+| `Wonders7` | 29 | `wonders`: 4–7 of the seven wonders |
+| `CantStop` | 13 | Column maxima, `COLUMNS_TO_WIN`, and `MARKERS` |
+
+Use `PILES_EXHAUSTED_FOR_GAME_END` for Dominion, as in the checked-in config and
+current official table. Earlier notes recorded a spelling discrepancy. The
+`probe` command can check acceptance against a chosen evaluator; it consumes
+real evaluations when used with a live backend.
+
+### Evaluator APIs
+
+[`client.py`](src/ttbalance/client.py) implements the local, local-pool, hosted,
+and Modal backends. The hosted base configured here is
+`https://balance-competition.tabletopgames.ai/api/`. The
+[API documentation](https://balance-competition.tabletopgames.ai/documentation)
+describes submission, polling, and retrieval:
+
+```text
+POST /submit_run       {game, params, api_key, run_type} -> {runID}
+GET  /query_run?id=N                                  -> {run_status}
+GET  /retrieve_result?id=N&api_key=KEY                 -> {score, runID}
 ```
+
+Generate a hosted API key through the competition site's user settings and set
+`TTB_API_KEY`. The client polls about every ten seconds and retrieves a result
+after `complete`; it also tolerates pending states such as `created`. HTTP 400
+indicates rejected input and 401 a rejected key. Hosted availability after the
+competition is separate from the offline tooling.
+
+The [local evaluator](https://balance-competition.tabletopgames.ai/localsetup)
+uses a synchronous endpoint without an API key:
+
+```bash
+docker run --rm -p 3000:3000 longhousedev/localapi
+```
+
+```text
+POST http://localhost:3000/api/run_game
+     {game, params, run_type, timeout?} -> {score} or {error}
+```
+
+`timeout` is in milliseconds. During the campaign, useful parallelism came from
+multiple containers with one request in flight per container. One recorded
+six-CPU run took 2352 seconds versus 2379 seconds on one CPU; that single
+comparison informed our deployment choice, not a general scaling result.
+[`localapi.sh`](scripts/localapi.sh) manages the local pool,
+[`cloud_localapi.sh`](scripts/cloud_localapi.sh) bootstraps a VM pool, and
+[`modal_localapi.py`](modal_localapi.py) runs evaluations as Modal function calls.
+
+The evaluation API did not submit competition entries. Final bundles went
+through the website's Submit Entry form, which produced the leaderboard scores.
+
+## Submission ledger
+
+Recorded submissions, ordered by full score rather than submission time. Each
+row's change description names the experiment; its baseline is not necessarily
+the preceding row. Exact decimal scores below come from our submission record;
+the public leaderboard displays rounded values.
+
+| Entry | Full score | Recorded change |
+|---|---:|---|
+| `probe-w7-lo` | **3652.5** | 7 Wonders: a low-medium candidate |
+| `probe-w7-hi` | 3648.3 | 7 Wonders: the highest-medium candidate |
+| `probe-ek-895` | 3642.4 | Exploding Kittens: candidate then estimated at 895.4, n=7 |
+| `probe-w7-revert` | 3637.8 | Revert 7 Wonders from v7 to its v6 configuration |
+| `probe-cs-revert` | 3636.3 | Revert Can't Stop; the newer configuration was retained |
+| `sub-B-dom-w7div` | 3627.7 | Dominion swap and a different 7 Wonders configuration |
+| `sub-A-dominion` | 3620.1 | Higher-fast Dominion candidate; 32.4 below `probe-w7-lo` |
+| `medium-direct-v7` | 3607.2 | Three games changed together |
+| `medium-direct-v6` | 3605.6 | Can't Stop changed |
+| `medium-direct-v5` | 3562.3 | All four games changed, one using a single measurement |
+| `medium-direct-v4` | 3553.3 | Exploding Kittens changed |
+| `medium-direct-v3` | 3513.7 | Exploding Kittens changed |
+| `medium-confirmed-v2` | 3493.1 | Bundle confirmed at three or more repeats |
+| `confirmed-n7-v1` | 3490.0 | First recorded submission |
+
+These selected comparisons use explicit baselines. Full deltas are calculated
+from the scores above; medium deltas are historical estimates at the time of
+the experiment.
+
+| Change | Games changed | Estimated medium delta | Observed full delta |
+|---|---:|---:|---:|
+| v2 → v3 | 1 | +24.2 | +20.6 |
+| v3 → v4 | 1 | +13.4 | +39.6 |
+| v4 → v5 | 4 | +74.4 | +9.0 |
+| v6 → v7 | 3 | +44.9 | +1.6 |
+| v7 → `probe-w7-revert` | 1 | −14.8 | +30.6 |
+
+These few selected experiments do not identify stable per-game transfer
+coefficients. [`transfer.py`](src/ttbalance/transfer.py) provides ratio and
+scenario-projection helpers; [`calibrate.py`](src/ttbalance/calibrate.py) provides
+a small historical discount model. Their projections and worst-observed cases
+are exploratory summaries, not calibrated confidence bounds or guarantees.
+
+The archived final bundle has the following medium measurements. Its official
+full score is a separately measured total, not a sum of these medium estimates.
+
+| Game | Recorded medium mean | Observations |
+|---|---:|---:|
+| Dominion | 956.13 | 3 |
+| Exploding Kittens | 889.22 | 12 |
+| 7 Wonders | 898.02 | 7 |
+| Can't Stop | 910.92 | 7 |
+
+## Repository map and verification
+
+```text
 src/ttbalance/
-  spec.py           the rules you can change, and how to mutate them
-  client.py         evaluator backends: local, local pool, hosted, Modal
-  cache.py          every measurement ever made (SQLite)
-  evaluate.py       parallel measurement, budgets, and the knockout
-  encode.py         a configuration -> a row of numbers
-  multifidelity.py  cheap score as an input for predicting the expensive one
-  transfer.py       how much a medium gain carries over to full, per game
-  calibrate.py      medium estimate -> expected full score
-  mock.py           offline stand-in, so everything runs without the API
-  optimizers/       random, hill, pbil, ea, nori
-scripts/            evaluator pool, search loops, confirmation, screening
-docs/COMPETITION.md the task, the API, the scoring
+  spec.py           parameter spaces and mutations
+  client.py         evaluator backends
+  cache.py          observations and evaluator provenance
+  evaluate.py       parallel evaluation, shared budgets, and racing
+  encode.py         configurations as numeric rows
+  multifidelity.py  medium prediction with an optional fast-score feature
+  transfer.py       historical transfer scenarios
+  calibrate.py      historical medium-to-full discount summaries
+  mock.py           offline synthetic objective
+  optimizers/       random, hill, ea, pbil, nori
+scripts/            evaluator pools, search, confirmation, and screening
+config/             accepted parameters
+results/            archived winning submission and generated experiments
+tests/              offline regression coverage
 ```
 
-Run the offline suite with `python -B -m unittest discover -s tests -t .`.
-Install `requirements-dev.txt` to include every test. CI runs it on Python 3.10
-and 3.12, checks shell syntax, and exercises the offline reproduction command.
-Nori tests use a fake predictor and never contact its service, even when the SDK
-is installed; they validate orchestration, not real model quality.
+Run `python -B -m unittest discover -s tests -t .` after installing
+`requirements-dev.txt` to exercise all **72 tests**. CI checks Python 3.10 and
+3.12, shell syntax, and the offline reproduction command. Nori tests use a fake
+predictor even if its SDK is installed. They validate orchestration and budget
+handling; they do not reproduce model quality, historical measurements, or the
+competition placing.
 
----
+## Acknowledgments
 
-## Lessons
-
-Every submission's real score is in [`docs/SUBMISSIONS.md`](docs/SUBMISSIONS.md).
-
-### What worked
-
-* **Never trust one measurement.** Everything gets 3+ repeats before it is
-  believed. The first bundle, built from each game's best single score, read
-  **3781** and was really **3485** — nearly 300 points of luck.
-* **One change per submission.** This turns every submission into a clean
-  experiment. A single-game change carried over at **2.83×** its measured size;
-  a three-game bundle carried over at **0.04×**.
-* **Open the black box.** The server logs the actual and target win-rate tables.
-  The season's targets are published nowhere else.
-* **Cheap score as an input, not a ranking.** Average error predicting `medium`
-  drops from **28.21 to 25.97** when the `fast` score is one more column.
-
-### What went wrong
-
-One mistake repeats throughout: **reading a pattern out of very few points, then
-betting on it.**
-
-* *"`fast` is backwards for Exploding Kittens, correlation −0.79."* Measured
-  properly on the 18 configurations that have both, it is **+0.43**. Weak, not
-  backwards. The −0.79 was a rank correlation on a much smaller early sample,
-  and it got quoted as settled fact for days.
-* *"For 7 Wonders, a higher `medium` score means a worse `full` score."* Built
-  from one pair of submissions. Both probes testing it came back **positive**
-  (+5.9 and +4.2). There was no such relationship.
-* *"Dominion's `fast` is trustworthy"* — from **two** matching data points
-  (963 → 971, 961 → 969). A submission built on that swapped in a
-  higher-`fast` Dominion configuration and **lost 32.4 points**. The most
-  expensive of these mistakes.
-
-The pattern is always the same: a small sample produces a clean-looking story,
-the story becomes the plan, and the plan costs more than the noise it was
-built on. The habit that fixed it everywhere else — *measure again before
-believing* — is exactly the one that kept getting skipped when the claim was
-about a **relationship** rather than a score.
-
-Two more, less dramatic:
-
-* **Trusting the §6 breakdown when read at `fast`.** Twice it produced a
-  convincing direction (`SEETHEFUTURE=6`, then `NOPE=10`, each roughly halving
-  the distance) that `medium` then rejected. The breakdown is sound; reading it
-  at the cheap setting was not — the same trap as §2.
-* **A variance idea** — that well-balanced rules should bounce around more
-  between repeats, since their measured distance is mostly noise. Checked
-  against two configurations whose real scores we knew, and it was wrong: 15.3
-  versus 16.3, the opposite way round. Cheap to test, so cheap to drop.
-
-## Thanks
-
-To the [TAG framework](https://github.com/GAIGResearch/TabletopGames) and the
-competition organisers for shipping a local evaluator image. The whole approach
-depends on being able to run evaluations off the hosted queue.
+Thanks to the [TAG framework](https://github.com/GAIGResearch/TabletopGames),
+the competition organisers for the local evaluator, and
+[Synthefy](https://github.com/Synthefy/synthefy-nori) for Nori. The research
+perspective above also connects to
+[autoresearch](https://github.com/karpathy/autoresearch) and established
+[multi-fidelity black-box optimization](https://proceedings.mlr.press/v80/sen18a.html).
