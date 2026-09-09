@@ -37,6 +37,10 @@ class MockClient(BaseClient):
         self._targets = {g: self._make_target(g, sp)
                          for g, sp in self.specs.items()}
 
+    @property
+    def cache_identity(self) -> dict:
+        return {"backend": "mock", "seed": self.seed, "noise_scale": self.noise_scale}
+
     def _make_target(self, game: str, spec: GameSpec) -> Params:
         target: Params = {}
         for prm in spec.params:

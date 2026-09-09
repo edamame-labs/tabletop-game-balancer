@@ -11,28 +11,42 @@
 #   ./scripts/reproduce.sh search     # medium-direct search, one loop per game
 #   ./scripts/reproduce.sh confirm    # race the leaders to n>=3
 #   ./scripts/reproduce.sh bundle     # print the submission JSON
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
+[ -f .env ] && { set -a; . ./.env; set +a; }
 export PYTHONPATH=src
 STAGE="${1:-check}"
+PYTHON="${PYTHON:-python3}"
 
 case "$STAGE" in
 check)
-  python3 -m pip install -q -r requirements.txt
-  PYTHONPATH=src python3 -m unittest discover -s tests -t . 2>&1 | tail -3
+  "$PYTHON" -m pip install -q -r requirements.txt
+  "$PYTHON" -m unittest discover -s tests -t .
   echo "--- offline optimiser run against the built-in surrogate ---"
-  python3 -m ttbalance --backend mock --cache results/check.sqlite \
+  task_check_dir=$(mktemp -d)
+  trap 'rm -rf "$task_check_dir"' EXIT
+  "$PYTHON" -m ttbalance --backend mock --results-dir "$task_check_dir" \
+      --cache "$task_check_dir/cache.sqlite" --experiment check \
       search --game CantStop --optimizer pbil --generations 12 --budget 150
-  rm -f results/check.sqlite*
   ;;
 evaluator)
   ./scripts/localapi.sh start "${N:-10}"
   ;;
 diagnose)
   # Which games can a cheap run rank? Answered per game before trusting one.
-  python3 - <<'PY'
-import sqlite3, statistics as st
-c = sqlite3.connect("results/cache.sqlite")
+  "$PYTHON" - <<'PY'
+import os, statistics as st
+from ttbalance.cache import Cache
+from ttbalance.cli import storage_dir
+from types import SimpleNamespace
+args = SimpleNamespace(results_dir=os.environ.get("TTB_RESULTS_DIR", "results/experiments"),
+                       experiment=os.environ.get("TTB_EXPERIMENT", "default"),
+                       backend=os.environ.get("TTB_BACKEND", "local"), seed=1,
+                       evaluator_version=os.environ.get("TTB_EVALUATOR_VERSION", "unversioned"))
+path = os.environ.get("TTB_CACHE") or os.path.join(storage_dir(args), "cache.sqlite")
+if not os.path.isfile(path):
+    raise SystemExit("No observations yet; run search and confirm before diagnose.")
+c = Cache(path)._conn
 print("%-18s %8s %8s %7s  %s" % ("game", "spread", "sd", "SNR", "medium can rank?"))
 for g in ("ExplodingKittens", "CantStop", "Wonders7", "Dominion"):
     rows = c.execute("SELECT key,AVG(score) FROM observations WHERE game=? AND"
@@ -61,7 +75,7 @@ confirm)
   ./scripts/verify_all.sh
   ;;
 bundle)
-  python3 -m ttbalance best --show-params
+  "$PYTHON" -m ttbalance --backend "${TTB_BACKEND:-local}" best --show-params
   ;;
 *)
   echo "usage: $0 {check|evaluator|diagnose|search|confirm|bundle}"; exit 1 ;;

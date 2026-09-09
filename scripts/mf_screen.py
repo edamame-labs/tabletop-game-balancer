@@ -1,85 +1,79 @@
-"""Cheap parallel screening: fast-screen a wide pool, medium-verify the few.
+"""Fast-screen candidates, predict medium scores, and confirm the shortlist.
 
-A fast run takes ~2 min; a medium one 15-40. So we buy breadth at fast and
-depth at medium: score a large candidate pool cheaply
-in parallel on Modal, feed those scores to the multi-fidelity model as a
-feature (never as a ranker — fast tracks medium only weakly), and spend medium
-runs on the handful the model ranks highest.
+Uses the same experiment storage and cached Evaluator as the main CLI.
 """
-import json, sys, time
-sys.path.insert(0, 'src')
-from concurrent.futures import ThreadPoolExecutor
-import modal
-from ttbalance.cache import Cache
-from ttbalance.multifidelity import MultiFidelityModel
-from ttbalance.spec import canonical, load_specs
-
-GAME = sys.argv[1] if len(sys.argv) > 1 else "ExplodingKittens"
-POOL = int(sys.argv[2]) if len(sys.argv) > 2 else 300
-TOPK = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-WORKERS = 40
-
-spec = load_specs()[GAME]
-cache = Cache("results/cache.sqlite")
-f = modal.Cls.from_name("ttb-localapi", "Evaluator")()
-best = json.load(open('results/final_best.json'))
+import argparse
+import json
+import os
+from pathlib import Path
 import random
-rng = random.Random(11)
+import sys
 
-# Pool: mutations of the leaders plus fresh random draws.
-leaders = [json.loads(r[0]) for r in cache.best(GAME, "medium", limit=12, min_obs=2)]
-leaders = [p for p in leaders if not spec.validate(p)] or [best[GAME]]
-seen = set()
-pool = []
-while len(pool) < POOL and len(seen) < POOL * 20:
-    p = spec.mutate(rng.choice(leaders), rng, rate=0.25) if rng.random() < 0.7 else spec.sample(rng)
-    k = canonical(p)
-    if k in seen or spec.validate(p):
-        continue
-    seen.add(k); pool.append(p)
-print("pool %d" % len(pool), flush=True)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from ttbalance.cli import build_cache, refresh_entry, save_entry, storage_dir
+from ttbalance.client import ModalClient
+from ttbalance.evaluate import Evaluator, REJECTED
+from ttbalance.multifidelity import MultiFidelityModel
+from ttbalance.optimizers.surrogate import _candidates
+from ttbalance.spec import load_specs
 
-t0 = time.time()
-def fast_one(p):
+
+def screen(args, client, model):
+    spec = load_specs()[args.game]
+    cache = build_cache(args)
     try:
-        r = f.run.remote(GAME, p, "fast", 900000)
-        s = r.get("score")
-        if s:
-            cache.add(GAME, p, "fast", s)
-        return s
-    except Exception:
-        return None
-with ThreadPoolExecutor(WORKERS) as ex:
-    fast_scores = list(ex.map(fast_one, pool))
-ok = [(p, s) for p, s in zip(pool, fast_scores) if s]
-print("fast screened %d/%d in %.0fs" % (len(ok), len(pool), time.time() - t0), flush=True)
+        # Check training readiness before spending any screening evaluations.
+        if not model.fit(cache, spec, args.game):
+            raise ValueError("need at least five medium configurations before screening")
+        leaders = [json.loads(row[0]) for row in cache.best(args.game, "medium", limit=12, min_obs=2)]
+        leaders = [p for p in leaders if not spec.validate(p)] or [spec.default()]
+        candidates = _candidates(spec, leaders, random.Random(args.seed), args.pool, set(), rate=0.25)
+        fast = Evaluator(client, cache, args.game, run_type="fast", workers=args.workers)
+        cheap = fast.evaluate_many(candidates)
+        usable = [(p, score) for p, score in zip(candidates, cheap) if score != REJECTED]
+        if not usable:
+            raise ValueError("screening produced no usable candidates")
+        acquisition = model.acquisition(spec, [p for p, _ in usable], [s for _, s in usable])
+        order = sorted(range(len(usable)), key=lambda i: -acquisition[i])[:args.top]
+        picks = [usable[i][0] for i in order]
+        medium = Evaluator(client, cache, args.game, run_type="medium", workers=args.workers)
+        scores = medium.evaluate_many(picks, repeats=3)
+        confirmed = [(p, score, len(cache.scores(args.game, p, "medium")))
+                     for p, score in zip(picks, scores) if score != REJECTED]
+        confirmed = [row for row in confirmed if row[2] >= 3]
+        if not confirmed:
+            raise ValueError("no candidate completed three medium observations")
+        confirmed.sort(key=lambda row: -row[1])
+        directory = os.path.join(storage_dir(args), "entries")
+        refresh_entry(cache, args.game, directory)
+        p, mean, n = confirmed[0]
+        path = save_entry(args.game, p, mean, "medium", n, args.backend, directory)
+        print("Best screened candidate %.2f (n=%d); selected entry: %s" % (mean, n, path))
+        return confirmed
+    finally:
+        cache.close()
 
-m = MultiFidelityModel()
-if not m.fit(cache, spec, GAME):
-    print("not enough expensive data to fit"); raise SystemExit
-print("fitted on %d rows (%d with cheap feature)" % (m.n_train, m.n_with_cheap), flush=True)
 
-acq = m.acquisition(spec, [p for p, _ in ok], [s for _, s in ok])
-order = sorted(range(len(ok)), key=lambda i: -acq[i])[:TOPK]
-picks = [ok[i][0] for i in order]
-print("top-%d predicted: %s" % (TOPK, ", ".join("%.1f" % acq[i] for i in order)), flush=True)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("game", nargs="?", default="ExplodingKittens", choices=load_specs())
+    parser.add_argument("pool", nargs="?", type=int, default=300)
+    parser.add_argument("top", nargs="?", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=40)
+    parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--cache", default=os.environ.get("TTB_CACHE", ""))
+    parser.add_argument("--results-dir", default=os.environ.get("TTB_RESULTS_DIR", "results/experiments"))
+    parser.add_argument("--experiment", default=os.environ.get("TTB_EXPERIMENT", "default"))
+    parser.add_argument("--evaluator-version", default=os.environ.get("TTB_EVALUATOR_VERSION", "unversioned"))
+    parser.set_defaults(backend="modal")
+    args = parser.parse_args()
+    if min(args.pool, args.top, args.workers) < 1:
+        parser.error("pool, top and workers must be positive")
+    try:
+        screen(args, ModalClient(timeout_ms=3000000), MultiFidelityModel())
+    except (ValueError, RuntimeError) as exc:
+        parser.exit(1, "error: %s\n" % exc)
 
-def med_one(p):
-    out = []
-    for _ in range(3):
-        try:
-            r = f.run.remote(GAME, p, "medium", 3000000)
-            s = r.get("score")
-            if s:
-                cache.add(GAME, p, "medium", s); out.append(s)
-        except Exception:
-            pass
-    return (p, sum(out) / len(out) if out else 0)
-with ThreadPoolExecutor(min(WORKERS, TOPK)) as ex:
-    res = list(ex.map(med_one, picks))
-res.sort(key=lambda t: -t[1])
-print("\n=== medium confirmed (n=3) ===", flush=True)
-for p, s in res:
-    print("  %.1f" % s, flush=True)
-json.dump(res[0][0], open('results/mf_best_%s.json' % GAME, 'w'))
-print("BEST %.1f  (incumbent EK 895.4)" % res[0][1], flush=True)
+
+if __name__ == "__main__":
+    main()

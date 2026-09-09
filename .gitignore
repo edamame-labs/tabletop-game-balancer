@@ -9,3 +9,6 @@ results/*.log
 results/*.pid
 results/state/
 .DS_Store
+results/experiments/
+results/bench/
+results/nohup-*.out

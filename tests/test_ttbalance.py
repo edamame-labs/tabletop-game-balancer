@@ -143,18 +143,10 @@ class TestEvaluator(unittest.TestCase):
 class TestOptimizers(unittest.TestCase):
     @staticmethod
     def _runnable_optimizers():
-        """Skip optimisers whose optional dependencies are absent: `nori` needs
-        numpy and the Nori SDK, and a missing extra should not fail the suite."""
-        out = {}
-        for name, fn in REGISTRY.items():
-            if name == "nori":
-                try:
-                    import numpy  # noqa: F401
-                    import synthefy_nori  # noqa: F401
-                except Exception:
-                    continue
-            out[name] = fn
-        return out
+        """Baseline checks use local optimizers; Nori is tested with a fake SDK."""
+        # Nori mechanics have dedicated tests with a fake predictor below.
+        # Installing its SDK must never make the offline suite call its service.
+        return {name: fn for name, fn in REGISTRY.items() if name != "nori"}
 
     def test_every_optimizer_beats_a_random_baseline(self):
         client = MockClient(seed=11)
@@ -459,13 +451,12 @@ class TestMultiHostPool(unittest.TestCase):
 
 try:
     import numpy  # noqa: F401
-    import synthefy_nori  # noqa: F401
-    _HAVE_NORI = True
+    _HAVE_NUMPY = True
 except Exception:
-    _HAVE_NORI = False
+    _HAVE_NUMPY = False
 
 
-@unittest.skipUnless(_HAVE_NORI, "needs numpy + synthefy_nori (.venv-nori)")
+@unittest.skipUnless(_HAVE_NUMPY, "needs numpy")
 class TestSurrogateUpgrades(unittest.TestCase):
     """The three surrogate.py upgrades: re-observation depth, batch diversity
     via local penalisation, and the trust-region mutation rate."""
@@ -473,6 +464,26 @@ class TestSurrogateUpgrades(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        import types
+        from unittest.mock import patch
+        import numpy as np
+
+        class FakeNoriRegressor:
+            def __init__(self, **kwargs):
+                pass
+            def fit(self, X, y):
+                self.X, self.y = np.asarray(X), np.asarray(y)
+            def predict(self, X, output_type="mean", quantiles=None):
+                X = np.asarray(X)
+                nearest = ((X[:, None, :] - self.X[None, :, :]) ** 2).sum(axis=2).argmin(axis=1)
+                mean = self.y[nearest]
+                return (mean, mean + 20) if output_type == "quantiles" else mean
+
+        sdk = types.ModuleType("synthefy_nori")
+        sdk.NoriRegressor = FakeNoriRegressor
+        patched = patch.dict(sys.modules, {"synthefy_nori": sdk})
+        patched.start()
+        cls.addClassCleanup(patched.stop)
         from ttbalance.optimizers.surrogate import optimize
         cls.cache = tmp_cache()
         cls.ev = Evaluator(MockClient(seed=7), cls.cache, "CantStop",

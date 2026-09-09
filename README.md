@@ -211,12 +211,27 @@ measurement discipline around it, not by the model.
 
 ## Running it
 
+Use Python 3.10 or later. Install the base dependencies in a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Optional dependencies are separate: `requirements-dev.txt` adds NumPy and pandas
+for the complete offline test suite; `requirements-nori.txt` adds the Nori SDK;
+`requirements-modal.txt` adds Modal. Install both Nori and Modal requirements into
+`.venv-nori` before using `scripts/search_modal_medium.sh`. Nori service calls
+also require the SDK's configured credentials.
+
 ```bash
 ./scripts/reproduce.sh check       # offline: tests + an optimiser run, no API needed
 ./scripts/reproduce.sh evaluator   # start 10 local evaluator containers (needs Docker)
-./scripts/reproduce.sh diagnose    # per-game noise check from §2
 ./scripts/reproduce.sh search      # search at medium, one loop per game
-./scripts/reproduce.sh confirm     # knockout the leaders to 3+ measurements
+# Stop the search loops before confirmation uses their container pool.
+./scripts/reproduce.sh confirm     # knockout the leaders to 7 measurements
+./scripts/reproduce.sh diagnose    # per-game noise check from collected measurements
 ./scripts/reproduce.sh bundle      # print the submission JSON
 ```
 
@@ -225,6 +240,51 @@ optimiser loop against [`mock.py`](src/ttbalance/mock.py), a stand-in for the
 API that runs offline. The later steps need a real evaluator and take hours.
 
 For Modal: `modal deploy modal_localapi.py`, then pass `--backend modal`.
+
+Search and confirmation scripts default to `medium`; `RUN_TYPE=fast` explicitly
+selects cheap runs. `DRY_RUN=1 ./scripts/search_all.sh` and
+`DRY_RUN=1 ./scripts/verify_all.sh` print the exact commands without starting
+containers or evaluations. `PASSES=1` bounds each search loop to one pass.
+`reproduce.sh check` uses a temporary directory for its mock cache, entries, and
+PBIL state, and returns a failure status when a test or optimizer run fails.
+
+### Experiment storage and existing results
+
+CLI observations, entries, and optimizer state now live under:
+
+```text
+results/experiments/<experiment>/<backend>/<evaluator-version>/
+  cache.sqlite
+  entries/<game>.json
+  state/<run-type>/pbil_<game>.json
+```
+
+Use `--experiment` and `--evaluator-version` (or `TTB_EXPERIMENT` and
+`TTB_EVALUATOR_VERSION`) consistently for search, verify, best, status, and
+screening. Version labels default to `unversioned`; set a stable label for the
+actual evaluator image digest or revision whenever that evaluator changes
+(for example, `sha256-<hex>` using a hyphen instead of a colon).
+Mock directories include their seed because it changes the simulated objective.
+`--results-dir` / `TTB_RESULTS_DIR` relocates all generated artifacts.
+
+An explicit `--cache` / `TTB_CACHE` must match the stored backend, mock settings,
+experiment, and evaluator version. Legacy SQLite files without provenance are
+preserved but cannot be reused by evaluation commands automatically: their
+observations may mix mock and real runs. Start a new experiment/cache; keep the
+old database for separate inspection. Existing `results/entries` and
+`results/state` files are not imported. The archived winning submission remains
+in `results/winning_submission.json`.
+
+`--budget` is shared across games within search, verify, and probe. It counts
+calls to the evaluator's `score` method, including failed calls; internal
+transport retries are not separately metered. `bench` grants the stated budget
+to each optimizer/game case for comparison. Budget-limited confirmation reports
+incomplete repeat counts and does not promote an underconfirmed entry.
+
+Within one process, duplicate batch members and evaluators sharing a `Cache`
+object reuse in-flight work. Separate processes must still use disjoint container
+pools. Backend errors are reported and counted; a batch with no usable scores
+fails, and unexpected programming errors propagate.
 
 ---
 
@@ -246,7 +306,11 @@ scripts/            evaluator pool, search loops, confirmation, screening
 docs/COMPETITION.md the task, the API, the scoring
 ```
 
-44 tests: `PYTHONPATH=src python3 -m unittest discover -s tests -t .`
+Run the offline suite with `python -B -m unittest discover -s tests -t .`.
+Install `requirements-dev.txt` to include every test. CI runs it on Python 3.10
+and 3.12, checks shell syntax, and exercises the offline reproduction command.
+Nori tests use a fake predictor and never contact its service, even when the SDK
+is installed; they validate orchestration, not real model quality.
 
 ---
 
