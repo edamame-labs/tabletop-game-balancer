@@ -6,6 +6,8 @@ averaged, which is how we fight the noise in low-fidelity runs.
 """
 from __future__ import annotations
 
+import json
+import math
 import os
 import sqlite3
 import threading
@@ -15,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 from .spec import Params, canonical
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS observations (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     game     TEXT NOT NULL,
@@ -33,11 +36,13 @@ CREATE TABLE IF NOT EXISTS params (
 
 
 class Cache:
-    def __init__(self, path: str = "results/cache.sqlite"):
+    def __init__(self, path: str = "results/cache.sqlite", context: Optional[dict] = None):
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
         self.path = path
+        self.context = context or {}
+        self._evaluation_locks = {}
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
         # A background search and an interactive command routinely hold this
@@ -48,7 +53,40 @@ class Cache:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
+    def bind(self, identity: dict) -> None:
+        """Reject incompatible or unlabelled observations; never guess provenance."""
+        expected = json.dumps({"client": identity, "context": self.context}, sort_keys=True)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT value FROM metadata WHERE key='identity'").fetchone()
+                if row and row[0] != expected:
+                    raise ValueError("cache belongs to a different evaluator or experiment; "
+                                     "choose a separate --cache or --experiment")
+                if not row:
+                    if self._conn.execute("SELECT 1 FROM observations LIMIT 1").fetchone():
+                        raise ValueError("cache has observations without evaluator provenance; "
+                                         "preserve it and choose a new --cache")
+                    self._conn.execute("INSERT INTO metadata VALUES ('identity', ?)",
+                                       (expected,))
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def evaluation_lock(self, game: str, params: Params, run_type: str):
+        """Serialize work on one configuration across evaluators sharing this cache."""
+        key = (game, canonical(params), run_type)
+        with self._lock:
+            return self._evaluation_locks.setdefault(key, threading.Lock())
+
+    def close(self) -> None:
+        self._conn.close()
+
     def add(self, game: str, params: Params, run_type: str, score: float) -> None:
+        if not math.isfinite(score):
+            raise ValueError("evaluation score must be finite")
         key = canonical(params)
         with self._lock:
             self._conn.execute(

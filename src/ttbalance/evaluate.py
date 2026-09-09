@@ -10,10 +10,10 @@ import math
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 from .cache import Cache
-from .client import BaseClient, RunRejected
+from .client import ApiError, BaseClient, RunRejected
 from .spec import Params, canonical
 
 REJECTED = float("-inf")
@@ -23,31 +23,60 @@ class BudgetExhausted(RuntimeError):
     pass
 
 
+class CallBudget:
+    """One thread-safe evaluation budget, optionally shared across games."""
+
+    def __init__(self, limit: Optional[int] = None):
+        if limit is not None and limit < 0:
+            raise ValueError("budget must be nonnegative")
+        self.limit = limit
+        self.used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def remaining(self) -> float:
+        with self._lock:
+            return math.inf if self.limit is None else self.limit - self.used
+
+    def take(self, n: int = 1) -> None:
+        with self._lock:
+            if self.limit is not None and self.used + n > self.limit:
+                raise BudgetExhausted("API budget of %d evaluations exhausted" % self.limit)
+            self.used += n
+
+
 class Evaluator:
     def __init__(self, client: BaseClient, cache: Cache, game: str,
                  run_type: str = "fast", repeats: int = 1, workers: int = 4,
-                 budget: Optional[int] = None, verbose: bool = True):
+                 budget: Optional[Union[int, CallBudget]] = None, verbose: bool = True):
+        if repeats < 1 or workers < 1:
+            raise ValueError("repeats and workers must be positive")
+        cache.bind(client.cache_identity)
         self.client = client
         self.cache = cache
         self.game = game
         self.run_type = run_type
         self.repeats = repeats
         self.workers = workers
-        self.budget = budget
+        self._budget = budget if isinstance(budget, CallBudget) else CallBudget(budget)
+        self.budget = self._budget.limit
         self.verbose = verbose
         self.n_calls = 0
         self.n_cached = 0
+        self.n_failed = 0
+        self.n_rejected = 0
         self.exhausted = False
         self._lock = threading.Lock()
         self._rejected = set()
 
     # -- budget ---------------------------------------------------------
     def _take(self, n: int = 1) -> None:
+        try:
+            self._budget.take(n)
+        except BudgetExhausted:
+            self.exhausted = True
+            raise
         with self._lock:
-            if self.budget is not None and self.n_calls + n > self.budget:
-                self.exhausted = True
-                raise BudgetExhausted(
-                    "API budget of %d calls exhausted" % self.budget)
             self.n_calls += n
 
     def check(self) -> None:
@@ -59,7 +88,7 @@ class Evaluator:
 
     @property
     def remaining(self) -> float:
-        return math.inf if self.budget is None else self.budget - self.n_calls
+        return self._budget.remaining
 
     # -- core -----------------------------------------------------------
     def observe(self, params: Params, run_type: Optional[str] = None,
@@ -67,20 +96,35 @@ class Evaluator:
         """Ensure at least `repeats` observations exist; return all of them."""
         rt = run_type or self.run_type
         want = self.repeats if repeats is None else repeats
+        if want < 1:
+            raise ValueError("repeats must be positive")
+        with self.cache.evaluation_lock(self.game, params, rt):
+            return self._observe_locked(params, rt, want)
+
+    def _observe_locked(self, params: Params, rt: str, want: int) -> List[float]:
         key = (canonical(params), rt)
         if key in self._rejected:
             return []
         have = self.cache.scores(self.game, params, rt)
-        self.n_cached += min(len(have), want)
+        with self._lock:
+            self.n_cached += min(len(have), want)
         while len(have) < want:
             self._take()
             try:
                 score = self.client.score(self.game, params, rt)
             except RunRejected as exc:
                 self._rejected.add(key)
+                with self._lock:
+                    self.n_rejected += 1
                 if self.verbose:
                     print("  ! rejected: %s" % exc, file=sys.stderr)
                 return []
+            except ApiError as exc:
+                with self._lock:
+                    self.n_failed += 1
+                print("  ! backend failure (%s/%s): %s" %
+                      (self.game, rt, exc), file=sys.stderr)
+                raise
             self.cache.add(self.game, params, rt, score)
             have.append(score)
         return have
@@ -96,27 +140,39 @@ class Evaluator:
                       ) -> List[float]:
         """Evaluate a batch in parallel. Budget exhaustion truncates the batch
         rather than losing the work already done."""
+        groups = {}
+        for i, p in enumerate(batch):
+            groups.setdefault(canonical(p), []).append(i)
+        unique = [(indices, batch[indices[0]]) for indices in groups.values()]
         out: List[float] = [REJECTED] * len(batch)
+        failures = []
 
-        def job(i_p: Tuple[int, Params]) -> None:
-            i, p = i_p
+        def job(item) -> None:
+            indices, p = item
             try:
-                out[i] = self.evaluate(p, run_type, repeats)
+                score = self.evaluate(p, run_type, repeats)
             except BudgetExhausted:
-                out[i] = REJECTED
-            except Exception:
-                # a transient backend failure on one candidate drops that
-                # candidate, never the whole batch (important for cloud runs).
-                out[i] = REJECTED
-            if on_result:
-                on_result(p, out[i])
+                # Keep paid observations even if the repeat target was cut short.
+                obs = self.cache.scores(self.game, p, run_type or self.run_type)
+                score = sum(obs) / len(obs) if obs else REJECTED
+            except ApiError as exc:
+                with self._lock:
+                    failures.append(str(exc))
+                score = REJECTED
+            for i in indices:
+                out[i] = score
+                if on_result:
+                    on_result(batch[i], score)
 
         if self.workers <= 1:
-            for item in enumerate(batch):
+            for item in unique:
                 job(item)
         else:
             with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                list(pool.map(job, list(enumerate(batch))))
+                list(pool.map(job, unique))
+        if failures and all(s == REJECTED for s in out):
+            raise ApiError("batch produced no usable scores (%d backend failures): %s" %
+                           (len(failures), failures[0]))
         return out
 
     # -- noise handling -------------------------------------------------
@@ -129,7 +185,11 @@ class Evaluator:
         survivors. This is what stops the search from crowning a configuration
         that merely got a lucky 36-matchup draw.
         """
-        pool = list(candidates)
+        if keep < 1 or not rounds or any(n < 1 for n in rounds):
+            raise ValueError("race requires positive keep and repeat targets")
+        if list(rounds) != sorted(set(rounds)):
+            raise ValueError("race repeat targets must strictly increase")
+        pool = list({canonical(p): p for p in candidates}.values())
         for r, reps in enumerate(rounds):
             if not pool:
                 break
@@ -150,9 +210,11 @@ class Evaluator:
         final = []
         for p in pool[:keep]:
             obs = self.cache.scores(self.game, p, run_type or self.run_type)
-            final.append((p, sum(obs) / len(obs) if obs else REJECTED, len(obs)))
+            if obs:
+                final.append((p, sum(obs) / len(obs), len(obs)))
         return final
 
     def summary(self) -> str:
-        return ("%s/%s: %d API calls, %d cache hits"
-                % (self.game, self.run_type, self.n_calls, self.n_cached))
+        return ("%s/%s: %d evaluation calls, %d cache hits, %d backend failures, "
+                "%d rejected configurations" % (self.game, self.run_type, self.n_calls,
+                self.n_cached, self.n_failed, self.n_rejected))

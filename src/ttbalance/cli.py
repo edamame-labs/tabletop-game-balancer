@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
+import re
+import tempfile
 import sys
 import time
 from typing import Dict, List, Optional
 
 from .cache import Cache
 from .client import ApiError, RunRejected, make_client
-from .evaluate import REJECTED, Evaluator
+from .evaluate import REJECTED, BudgetExhausted, CallBudget, Evaluator
 from .mock import MockClient
 from .optimizers import REGISTRY
 from .spec import GAMES, RUN_TYPES, GameSpec, Params, canonical, load_specs
@@ -36,7 +39,7 @@ def build_client(args):
             urls = [base] * max(1, args.pool_replicas)
         elif getattr(args, "pool_hosts", ""):
             urls = parse_pool_spec(args.pool_hosts)
-        return make_client("local", local_url=args.local_url or DEFAULT_LOCAL,
+        return make_client("local", local_url=args.local_url,
                            pool=args.local_pool, first_port=args.first_port,
                            pool_url_list=urls,
                            timeout_ms=args.timeout_ms or None)
@@ -60,16 +63,38 @@ def games_from(args) -> List[str]:
     return args.game
 
 
-def entry_path(game: str) -> str:
-    return os.path.join("results", "entries", "%s.json" % game)
+def storage_dir(args) -> str:
+    for value in (args.experiment, args.evaluator_version):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+            raise ValueError("experiment and evaluator version must be safe directory names")
+    backend = args.backend
+    if backend == "mock":
+        backend += "-seed-%d" % args.seed
+    return os.path.join(args.results_dir, args.experiment, backend, args.evaluator_version)
+
+
+def build_cache(args) -> Cache:
+    cache = Cache(args.cache or os.path.join(storage_dir(args), "cache.sqlite"),
+                  context={"experiment": args.experiment,
+                           "evaluator_version": args.evaluator_version})
+    identity = (MockClient(seed=args.seed).cache_identity if args.backend == "mock"
+                else {"backend": args.backend})
+    cache.bind(identity)
+    return cache
+
+
+def entry_path(game: str, directory: str = "results/entries") -> str:
+    return os.path.join(directory, "%s.json" % game)
 
 
 FIDELITY = {"fast": 0, "medium": 1, "full": 2}
 
 
 def save_entry(game: str, params: Params, score: float, run_type: str,
-               n_obs: int, backend: str) -> str:
-    path = entry_path(game)
+               n_obs: int, backend: str, directory: str = "results/entries") -> str:
+    if n_obs < 1 or not math.isfinite(score):
+        raise ValueError("an entry needs observations and a finite score")
+    path = entry_path(game, directory)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     prev = None
     if os.path.exists(path):
@@ -79,6 +104,10 @@ def save_entry(game: str, params: Params, score: float, run_type: str,
               "run_type": run_type, "observations": n_obs, "backend": backend,
               "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if prev:
+        normalize = lambda name: "local" if name == "local-pool" else name
+        if normalize(prev.get("backend")) != normalize(backend):
+            raise ValueError("entry belongs to a different evaluator; use a separate directory")
+        same_config = canonical(prev["params"]) == canonical(params)
         old_f = FIDELITY.get(prev.get("run_type", "fast"), 0)
         new_f = FIDELITY.get(run_type, 0)
         old_n = prev.get("observations", 0)
@@ -89,16 +118,35 @@ def save_entry(game: str, params: Params, score: float, run_type: str,
             return path
         if new_f == old_f:
             # At equal fidelity, never let a LESS-observed config replace a
-            # better-confirmed one — a lucky n=2 draw reading 961 must not evict
-            # a confirmed n=7 at 941. Overwrite only when the newcomer is at
-            # least as well observed and genuinely higher.
+            # better-confirmed one. A different configuration must also score
+            # higher; the same configuration can have its mean revised down.
             if n_obs < old_n:
                 return path
-            if score <= old_s and n_obs == old_n:
+            if score <= old_s and (not same_config or n_obs == old_n):
                 return path
-    with open(path, "w") as fh:
-        json.dump(record, fh, indent=2, sort_keys=True)
+    # Readers must see either the previous complete entry or the new one.
+    with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path),
+                                     delete=False) as fh:
+        temporary = fh.name
+        try:
+            json.dump(record, fh, indent=2, sort_keys=True)
+        except Exception:
+            os.unlink(temporary)
+            raise
+    os.replace(temporary, path)
     return path
+
+
+def refresh_entry(cache: Cache, game: str, directory: str) -> None:
+    path = entry_path(game, directory)
+    if not os.path.exists(path):
+        return
+    with open(path) as fh:
+        previous = json.load(fh)
+    obs = cache.scores(game, previous["params"], previous["run_type"])
+    if len(obs) > previous.get("observations", 0):
+        save_entry(game, previous["params"], sum(obs) / len(obs),
+                   previous["run_type"], len(obs), previous["backend"], directory)
 
 
 def pick_entry(cache: Cache, spec: GameSpec, game: str, run_type: str,
@@ -122,10 +170,13 @@ def pick_entry(cache: Cache, spec: GameSpec, game: str, run_type: str,
 # ---------------------------------------------------------------- commands
 def cmd_search(args) -> None:
     specs = load_specs()
-    cache = Cache(args.cache)
+    cache = build_cache(args)
     client = build_client(args)
     rng = random.Random(args.seed)
     opt = REGISTRY[args.optimizer]
+    budget = CallBudget(args.budget)
+    directory = os.path.join(storage_dir(args), "entries")
+    failed = False
 
     for game in games_from(args):
         spec = specs[game]
@@ -133,14 +184,14 @@ def cmd_search(args) -> None:
               (game, args.optimizer, client.name, args.run_type))
         ev = Evaluator(client, cache, game, run_type=args.run_type,
                        repeats=args.repeats, workers=args.workers,
-                       budget=args.budget, verbose=not args.quiet)
+                       budget=budget, verbose=not args.quiet)
         seeds = load_seeds(cache, spec, game, args.run_type, args.seed_from_cache)
         kwargs = dict(json.loads(args.opt_args)) if args.opt_args else {}
         if args.optimizer == "pbil":
             # Persist the learned distribution so short repeated passes keep
             # compounding instead of restarting from uniform every time.
             kwargs.setdefault("state_path",
-                              os.path.join("results", "state",
+                              os.path.join(storage_dir(args), "state", args.run_type,
                                            "pbil_%s.json" % game))
         if seeds:
             kwargs.setdefault("seeds", seeds)
@@ -150,18 +201,20 @@ def cmd_search(args) -> None:
                       generations=args.generations, **kwargs)
         except KeyboardInterrupt:
             raise
-        except Exception as exc:
-            # Docker down, connection reset, a bug in one optimiser — none of it
-            # should abort the other games or crash an unattended overnight run.
-            print("  interrupted (%s): %s" % (type(exc).__name__, exc))
+        except BudgetExhausted:
+            res = None
+        except ApiError as exc:
+            print("  backend failed: %s" % exc, file=sys.stderr)
+            failed = True
             res = None
         print("  %s" % ev.summary())
         if res and res.best_params:
             if args.optimizer == "pbil" and res.meta.get("marginals"):
                 print("  learned marginals:\n%s" % res.meta["marginals"])
+            refresh_entry(cache, game, directory)
             params, mean, n_obs = pick_entry(cache, spec, game, args.run_type,
                                              res.best_params)
-            print("  best single observation %.2f (noise-inflated)"
+            print("  best current mean %.2f"
                   % res.best_score)
             print("  recorded %.2f as the mean of %d observation%s%s"
                   % (mean, n_obs, "" if n_obs == 1 else "s",
@@ -170,7 +223,9 @@ def cmd_search(args) -> None:
             if params is not None:
                 print("  saved -> %s" % save_entry(game, params, mean,
                                                    args.run_type, n_obs,
-                                                   client.name))
+                                                   args.backend, directory))
+    if failed:
+        raise SystemExit(1)
 
 
 def load_seeds(cache: Cache, spec: GameSpec, game: str, run_type: str,
@@ -198,10 +253,13 @@ def load_seeds(cache: Cache, spec: GameSpec, game: str, run_type: str,
 def cmd_verify(args) -> None:
     """Re-evaluate the top cached configurations at a higher fidelity."""
     specs = load_specs()
-    cache = Cache(args.cache)
+    cache = build_cache(args)
     client = build_client(args)
+    budget = CallBudget(args.budget)
+    directory = os.path.join(storage_dir(args), "entries")
     for game in games_from(args):
         spec = specs[game]
+        refresh_entry(cache, game, directory)
         cands: List[Params] = []
         seen = set()
         for rt in (args.from_run_type, args.run_type):
@@ -212,8 +270,8 @@ def cmd_verify(args) -> None:
                 p = json.loads(key)
                 if not spec.validate(p):
                     cands.append(p)
-        if os.path.exists(entry_path(game)):
-            with open(entry_path(game)) as fh:
+        if os.path.exists(entry_path(game, directory)):
+            with open(entry_path(game, directory)) as fh:
                 p = json.load(fh)["params"]
             if canonical(p) not in seen:
                 cands.insert(0, p)
@@ -223,24 +281,32 @@ def cmd_verify(args) -> None:
         print("\n=== verify %s at %s (%d candidates) ===" %
               (game, args.run_type, len(cands)))
         ev = Evaluator(client, cache, game, run_type=args.run_type,
-                       repeats=1, workers=args.workers, budget=args.budget,
+                       repeats=1, workers=args.workers, budget=budget,
                        verbose=not args.quiet)
         finals = ev.race(cands, keep=args.keep, rounds=tuple(args.rounds))
         for p, s, n in finals:
             print("  %.2f  (n=%d)" % (s, n))
         if finals:
             best_p, best_s, best_n = finals[0]
+            refresh_entry(cache, game, directory)
+            if best_n < args.rounds[-1]:
+                print("  confirmation incomplete: need %d observations, have %d" %
+                      (args.rounds[-1], best_n))
+                print("  %s" % ev.summary())
+                continue
             print("  saved -> %s" % save_entry(game, best_p, best_s,
-                                               args.run_type, best_n, client.name))
+                                               args.run_type, best_n, args.backend, directory))
         print("  %s" % ev.summary())
 
 
 def cmd_best(args) -> None:
-    cache = Cache(args.cache)
+    cache = build_cache(args)
     total = 0.0
     bundle: Dict[str, object] = {}
+    directory = os.path.join(storage_dir(args), "entries")
     for game in games_from(args):
-        path = entry_path(game)
+        refresh_entry(cache, game, directory)
+        path = entry_path(game, directory)
         if not os.path.exists(path):
             print("%-18s (no entry yet)" % game)
             continue
@@ -268,12 +334,16 @@ def cmd_probe(args) -> None:
     """
     specs = load_specs()
     client = build_client(args)
+    budget = CallBudget(args.budget)
+    def score(game, params):
+        budget.take()
+        return client.score(game, params, "fast")
     for game in games_from(args):
         spec = specs[game]
         base = spec.default()
         print("\n=== probe %s ===" % game)
         try:
-            s = client.score(game, base, "fast")
+            s = score(game, base)
             print("  full default config accepted (score %.2f)" % s)
             continue
         except RunRejected as exc:
@@ -281,15 +351,19 @@ def cmd_probe(args) -> None:
         except ApiError as exc:
             print("  api error: %s" % exc)
             continue
+        except BudgetExhausted:
+            return
         for prm in spec.params:
             one = {prm.name: base[prm.name]}
             try:
-                client.score(game, one, "fast")
+                score(game, one)
                 print("  ok       %s" % prm.name)
             except RunRejected as exc:
                 print("  REJECTED %-32s %s" % (prm.name, str(exc)[:80]))
             except ApiError as exc:
                 print("  error    %-32s %s" % (prm.name, str(exc)[:80]))
+            except BudgetExhausted:
+                return
 
 
 def cmd_bench(args) -> None:
@@ -301,7 +375,8 @@ def cmd_bench(args) -> None:
     for name in (args.optimizers or ["random", "hill", "ea", "pbil"]):
         for game in games_from(args):
             spec = specs[game]
-            cache = Cache(os.path.join(args.bench_dir, "%s-%s.sqlite" % (name, game)))
+            cache = Cache(os.path.join(args.bench_dir, "seed-%d" % args.seed,
+                                       "%s-%s.sqlite" % (name, game)))
             ev = Evaluator(client, cache, game, run_type="fast", repeats=1,
                            workers=args.workers, budget=args.budget, verbose=False)
             res = REGISTRY[name](spec, ev, random.Random(args.seed),
@@ -313,10 +388,10 @@ def cmd_bench(args) -> None:
 
 
 def cmd_status(args) -> None:
-    cache = Cache(args.cache)
+    cache = build_cache(args)
     stats = cache.stats()
     if not stats:
-        print("cache is empty (%s)" % args.cache)
+        print("cache is empty (%s)" % cache.path)
         return
     print("%-18s %8s %8s %8s" % ("game", "fast", "medium", "full"))
     for game in GAMES:
@@ -352,13 +427,17 @@ def main(argv: Optional[List[str]] = None) -> None:
         p.add_argument("--pool-replicas", type=int,
                        default=int(os.environ.get("TTB_POOL_REPLICAS", "24")),
                        help="concurrent requests to --pool-url (= worker count)")
-        p.add_argument("--cache", default=os.environ.get("TTB_CACHE",
-                                                      "results/cache.sqlite"))
+        p.add_argument("--cache", default=os.environ.get("TTB_CACHE", ""),
+                       help="override cache path; evaluator provenance must match")
+        p.add_argument("--results-dir", default=os.environ.get("TTB_RESULTS_DIR", "results/experiments"))
+        p.add_argument("--experiment", default=os.environ.get("TTB_EXPERIMENT", "default"))
+        p.add_argument("--evaluator-version", default=os.environ.get("TTB_EVALUATOR_VERSION", "unversioned"),
+                       help="filesystem-safe evaluator revision label used to isolate results")
         p.add_argument("--game", nargs="*", default=["all"])
         p.add_argument("--run-type", default="fast", choices=sorted(RUN_TYPES))
         p.add_argument("--workers", type=int, default=4)
         p.add_argument("--budget", type=int, default=None,
-                    help="max API calls for this command")
+                    help="max evaluation calls across games (bench: per optimizer/game); transport retries are internal")
         p.add_argument("--seed", type=int, default=1)
         p.add_argument("--quiet", action="store_true")
     # Shared flags go on both the top-level parser and every subparser so they
@@ -417,7 +496,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = ap.parse_args(argv)
     if getattr(args, "budget", None) is None and args.cmd == "bench":
         args.budget = 1500
-    args.func(args)
+    try:
+        args.func(args)
+    except (ApiError, ValueError) as exc:
+        ap.exit(1, "error: %s\n" % exc)
 
 
 if __name__ == "__main__":

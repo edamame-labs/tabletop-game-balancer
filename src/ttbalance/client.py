@@ -29,6 +29,10 @@ class RunRejected(ApiError):
 class BaseClient:
     name = "base"
 
+    @property
+    def cache_identity(self) -> dict:
+        return {"backend": self.name}
+
     def score(self, game: str, params: Params, run_type: str = "fast") -> float:
         raise NotImplementedError
 
@@ -37,7 +41,7 @@ class LocalClient(BaseClient):
     name = "local"
 
     def __init__(self, base_url: str = "http://localhost:3000/api/",
-                 timeout_ms: Optional[int] = None, http_timeout: float = 900.0,
+                 timeout_ms: Optional[int] = None, http_timeout: float = 3600.0,
                  retries: int = 3):
         self.base_url = base_url.rstrip("/") + "/"
         self.timeout_ms = timeout_ms
@@ -80,6 +84,10 @@ class LocalPoolClient(BaseClient):
     """
 
     name = "local-pool"
+
+    @property
+    def cache_identity(self) -> dict:
+        return {"backend": "local"}
 
     def __init__(self, base_urls: Sequence[str], timeout_ms: Optional[int] = None,
                  http_timeout: float = 3600.0, retries: int = 3,
@@ -294,7 +302,7 @@ def make_client(backend: str, api_key: str = "", local_url: str = "",
             return LocalPoolClient(pool_urls(pool, first_port),
                                    prune=kw.pop("prune", False), **kw)
         kw.pop("prune", None)
-        return LocalClient(local_url or "http://localhost:3000/api/", **kw)
+        return LocalClient(local_url or pool_urls(1, first_port)[0], **kw)
     if backend == "hosted":
         return HostedClient(api_key, hosted_url or
                             "https://balance-competition.tabletopgames.ai/api/", **kw)

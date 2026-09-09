@@ -5,7 +5,7 @@
 # was doing. All per-game loops share the same container pool and cache.
 #
 #   GAME=CantStop ./scripts/search_game.sh
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -f .env ] && { set -a; . ./.env; set +a; }
 export PYTHONPATH=src
@@ -18,7 +18,12 @@ POOL_TOTAL="${POOL_TOTAL:-10}"  # full pool to keep alive
 BUDGET="${BUDGET:-40}"          # per pass; small so PBIL state updates often
 REPEATS="${REPEATS:-2}"        # observations per config -> optimise the mean, not a lucky draw
 
-echo $$ > "results/search-${GAME}.pid"
+RUN_TYPE="${RUN_TYPE:-medium}"
+PYTHON="${PYTHON:-python3}"
+if [ "${DRY_RUN:-0}" != 1 ]; then
+  mkdir -p results
+  echo $$ > "results/search-${GAME}.pid"
+fi
 LOG="results/search-${GAME}.log"
 
 heal() {
@@ -28,8 +33,8 @@ heal() {
   # Only one loop should rebuild the whole pool; a lock avoids 4 racing starts.
   if [ "${up:-0}" -lt "$POOL_TOTAL" ]; then
     if mkdir results/.heal.lock 2>/dev/null; then
-      trap 'rmdir results/.heal.lock 2>/dev/null' RETURN
-      ./scripts/localapi.sh start "$POOL_TOTAL" >> "$LOG" 2>&1
+      trap 'rmdir results/.heal.lock 2>/dev/null || true' RETURN
+      FIRST_PORT=3000 ./scripts/localapi.sh start "$POOL_TOTAL" >> "$LOG" 2>&1
       rmdir results/.heal.lock 2>/dev/null
     else
       sleep 30   # another loop is healing; wait it out
@@ -39,12 +44,18 @@ heal() {
 
 pass=0
 while true; do
-  pass=$((pass + 1)); heal
+  pass=$((pass + 1))
   if [ $((pass % 2)) -eq 1 ]; then OPT=pbil; else OPT=ea; fi
+  command=("$PYTHON" -u -m ttbalance --backend local --local-pool "$POOL" --workers "$POOL"
+      --first-port "$FIRST_PORT" --timeout-ms "${TIMEOUT_MS:-3000000}"
+      --run-type "$RUN_TYPE" --game "$GAME" --budget "$BUDGET" search --optimizer "$OPT"
+      --repeats "$REPEATS" --generations 500 --iterations 500)
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    printf '%q ' "${command[@]}"; printf '\n'; exit 0
+  fi
+  heal
   echo "=== $GAME pass $pass ($OPT) $(date '+%F %T') ===" >> "$LOG"
-  python3 -u -m ttbalance --backend local --local-pool "$POOL" --workers "$POOL" \
-      --first-port "$FIRST_PORT" --timeout-ms "${TIMEOUT_MS:-600000}" \
-      --game "$GAME" --budget "$BUDGET" search --optimizer "$OPT" \
-      --repeats "$REPEATS" --generations 500 --iterations 500 >> "$LOG" 2>&1
+  "${command[@]}" >> "$LOG" 2>&1
+  if [ "${PASSES:-0}" -gt 0 ] && [ "$pass" -ge "$PASSES" ]; then break; fi
   sleep 1
 done
